@@ -1,0 +1,253 @@
+---
+- hosts: all
+  become: yes
+  vars:
+    k8s_version: "1.32.4"
+    containerd_version: "2.0.0"
+    runc_version: "1.1.0"
+    crictl_version: "v1.26.0"
+    calico_version: "v3.29.3"
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    - name: Install prerequisites
+      apt:
+        name: "{{ packages }}"
+        state: present
+      vars:
+        packages:
+          - curl
+          - gnupg
+          - apt-transport-https
+          - ca-certificates
+          - jq
+
+    - name: Disable swap
+      command: swapoff -a
+      changed_when: false
+
+    - name: Remove swap from fstab
+      lineinfile:
+        path: /etc/fstab
+        regexp: '^.*swap.*$'
+        state: absent
+
+    - name: Load kernel modules
+      copy:
+        content: |
+          overlay
+          br_netfilter
+        dest: /etc/modules-load.d/containerd.conf
+
+    - name: Apply kernel modules
+      command: "{{ item }}"
+      with_items:
+        - modprobe overlay
+        - modprobe br_netfilter
+
+    - name: Configure sysctl
+      copy:
+        content: |
+          net.bridge.bridge-nf-call-iptables = 1
+          net.ipv4.ip_forward = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+        dest: /etc/sysctl.d/99-kubernetes-cri.conf
+
+    - name: Apply sysctl
+      command: sysctl --system
+
+    - name: Add Docker GPG key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker repository
+      apt_repository:
+        repo: deb https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable
+        state: present
+
+    - name: Download containerd
+      get_url:
+        url: https://github.com/containerd/containerd/releases/download/v{{ containerd_version }}/containerd-{{ containerd_version }}-linux-amd64.tar.gz
+        dest: /tmp/containerd-{{ containerd_version }}-linux-amd64.tar.gz
+
+    - name: Extract containerd
+      unarchive:
+        src: /tmp/containerd-{{ containerd_version }}-linux-amd64.tar.gz
+        dest: /usr/local
+        remote_src: yes
+
+    - name: Install containerd service
+      get_url:
+        url: https://raw.githubusercontent.com/containerd/containerd/v{{ containerd_version }}/containerd.service
+        dest: /etc/systemd/system/containerd.service
+        mode: '0644'
+
+    - name: Enable and start containerd
+      systemd:
+        name: containerd
+        enabled: yes
+        state: started
+    - name: Set containerd socket permissions
+      file:
+        path: /var/run/containerd/containerd.sock
+        mode: '0666'
+
+    - name: Install runc
+      get_url:
+        url: https://github.com/opencontainers/runc/releases/download/v{{ runc_version }}/runc.amd64
+        dest: /usr/local/sbin/runc
+        mode: '0755'
+
+    - name: Install crictl
+      unarchive:
+        src: https://github.com/kubernetes-sigs/cri-tools/releases/download/{{ crictl_version }}/crictl-{{ crictl_version }}-linux-amd64.tar.gz
+        dest: /usr/local/bin/
+        remote_src: yes
+
+    - name: Configure crictl runtime endpoint
+      copy:
+        content: |
+          runtime-endpoint: unix:///var/run/containerd/containerd.sock
+        dest: /etc/crictl.yaml
+        mode: '0644'
+
+    - name: Add Kubernetes GPG key
+      apt_key:
+        url: https://pkgs.k8s.io/core:/stable:/v1.32/deb/Release.key
+        state: present
+
+    - name: Add Kubernetes repository
+      apt_repository:
+        repo: deb https://pkgs.k8s.io/core:/stable:/v1.32/deb/ /
+        state: present
+
+    - name: Install Kubernetes components
+      apt:
+        name: "{{ packages }}"
+        state: present
+        update_cache: yes
+      vars:
+        packages:
+          - kubelet={{ k8s_version }}-1.1
+          - kubeadm={{ k8s_version }}-1.1
+          - kubectl={{ k8s_version }}-1.1
+
+    - name: Hold Kubernetes packages
+      dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+    
+
+    - name: Control plane node configuration
+      when: node_role == "control-plane"
+      block:
+        - name: Initialize control plane
+          command: kubeadm init --pod-network-cidr=192.168.0.0/16 --kubernetes-version={{ k8s_version }} --apiserver-advertise-address={{ apiserver_advertise_address }} --cri-socket unix:///var/run/containerd/containerd.sock
+          register: kubeadm_init
+          failed_when: kubeadm_init.rc != 0 and "already exists" not in kubeadm_init.stderr
+
+        - name: Set up kubeconfig
+          block:
+            - name: Create .kube directory
+              file:
+                path: /root/.kube
+                state: directory
+            - name: Copy admin.conf
+              copy:
+                src: /etc/kubernetes/admin.conf
+                dest: /root/.kube/config
+                remote_src: yes
+            - name: Set ownership
+              file:
+                path: /root/.kube/config
+                owner: root
+                group: root
+            - name: Copy admin.conf to shared
+              copy:
+                src: /etc/kubernetes/admin.conf
+                dest: /shared/config
+                remote_src: yes
+            - name: Create vagrant dir
+              file:
+                path: /home/vagrant/.kube
+                state: directory
+            - name: Copy admin.conf to vagrant
+              copy:
+                src: /etc/kubernetes/admin.conf
+                dest: /home/vagrant/.kube/config
+                remote_src: yes
+            - name: Set ownership
+              file:
+                path: /home/vagrant/.kube/config
+                owner: vagrant
+                group: vagrant
+
+        - name: Install Tigera Calico operator
+          ansible.builtin.shell: |
+            kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/{{ calico_version }}/manifests/tigera-operator.yaml || true
+          become_user: "{{ ansible_user }}"
+          changed_when: true
+        - name: Download Calico custom resources
+          ansible.builtin.get_url:
+            url: "https://raw.githubusercontent.com/projectcalico/calico/{{ calico_version }}/manifests/custom-resources.yaml"
+            dest: /tmp/custom-resources.yaml
+            mode: "0644"
+        - name: Apply Calico custom resources
+          ansible.builtin.shell: |
+            kubectl create -f /tmp/custom-resources.yaml || true
+          become_user: "{{ ansible_user }}"
+          changed_when: true
+        - name: Remove control-plane taint (for single-node clusters)
+          ansible.builtin.shell: |
+            kubectl taint nodes --all node-role.kubernetes.io/control-plane- || true
+          become_user: "{{ ansible_user }}"
+          changed_when: false
+
+        - name: Wait for Calico node pods to exist
+          ansible.builtin.shell: |
+            kubectl get po -l k8s-app=calico-node -n calico-system -ojson | jq -r '.items | length'
+          become_user: "{{ ansible_user }}"
+          changed_when: false
+          register: calico_pods
+          until: calico_pods.stdout | int > 0
+          retries: 15
+          delay: 2
+        - name: Verify Calico pods
+          ansible.builtin.shell: |
+            kubectl wait po -lk8s-app=calico-node -ncalico-system --for condition=Ready --timeout=120s
+          become_user: "{{ ansible_user }}"
+
+        - name: Copy join command to shared directory
+          shell: |
+            token=$(kubeadm token generate)
+            kubeadm token create $token --ttl=2h
+            ca_cert_hash=$(openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -hex | sed 's/^.* //')
+            echo "kubeadm join {{ apiserver_advertise_address }}:6443 --token $token --discovery-token-ca-cert-hash sha256:$ca_cert_hash" > /shared/join-command.sh
+          args:
+            creates: /shared/join-command.sh
+
+
+    - name: Worker node configuration
+      when: node_role == "worker"
+      block:
+        - name: Copy join-command.sh to user's home
+          ansible.builtin.copy:
+            src: /shared/join-command.sh
+            dest: "{{ ansible_env.HOME }}/join-command.sh"
+            mode: '0755'
+            owner: "root"
+            group: "root"
+            remote_src: yes
+          become: yes
+        - name: Run join-command.sh
+          when: node_role == "worker"
+          ansible.builtin.shell: |
+            {{ ansible_env.HOME }}/join-command.sh
+          changed_when: true
