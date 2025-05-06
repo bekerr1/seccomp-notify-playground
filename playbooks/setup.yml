@@ -4,7 +4,7 @@
   vars:
     k8s_version: "1.32.4"
     containerd_version: "2.0.0"
-    runc_version: "1.1.0"
+    runc_version: "1.1.11"
     crictl_version: "v1.26.0"
     calico_version: "v3.29.3"
   tasks:
@@ -143,13 +143,38 @@
         - kubelet
         - kubeadm
         - kubectl
-    
 
     - name: Control plane node configuration
       when: node_role == "control-plane"
       block:
+        # I tried for ages to get a VB setup without the default network 
+        # being the NAT gateway but was unsuccessful. So im going with 
+        # this private network model but the kubelet must be configured to 
+        # use the private IP instead of the default. Unfortunate :(
+        - name: Write kubeadm init config with custom node IP
+          copy:
+            dest: "{{ init_file }}"
+            content: |
+              apiVersion: kubeadm.k8s.io/v1beta4
+              kind: InitConfiguration
+              localAPIEndpoint:
+                advertiseAddress: "{{ apiserver_advertise_address }}"
+                bindPort: 6443
+              nodeRegistration:
+                criSocket: unix:///var/run/containerd/containerd.sock
+                kubeletExtraArgs:
+                - name: node-ip
+                  value: "{{ node_ip }}"
+              ---
+              apiVersion: kubeadm.k8s.io/v1beta4
+              kind: ClusterConfiguration
+              kubernetesVersion: "{{ k8s_version }}"
+              controlPlaneEndpoint: "{{ apiserver_advertise_address }}:6443"
+              networking:
+                podSubnet: "192.168.0.0/16"
+
         - name: Initialize control plane
-          command: kubeadm init --pod-network-cidr=192.168.0.0/16 --kubernetes-version={{ k8s_version }} --apiserver-advertise-address={{ apiserver_advertise_address }} --cri-socket unix:///var/run/containerd/containerd.sock
+          command: kubeadm init --config "{{ init_file }}"
           register: kubeadm_init
           failed_when: kubeadm_init.rc != 0 and "already exists" not in kubeadm_init.stderr
 
@@ -169,10 +194,10 @@
                 path: /root/.kube/config
                 owner: root
                 group: root
-            - name: Copy admin.conf to shared
+            - name: Copy admin.conf to private
               copy:
                 src: /etc/kubernetes/admin.conf
-                dest: /shared/config
+                dest: /private/config
                 remote_src: yes
             - name: Create vagrant dir
               file:
@@ -221,33 +246,77 @@
           delay: 2
         - name: Verify Calico pods
           ansible.builtin.shell: |
-            kubectl wait po -lk8s-app=calico-node -ncalico-system --for condition=Ready --timeout=120s
+            kubectl wait po -lk8s-app=calico-node -ncalico-system --for condition=Ready --timeout=360s
           become_user: "{{ ansible_user }}"
 
-        - name: Copy join command to shared directory
+        - name: Copy join command to private directory
           shell: |
+            rm "{{ join_file_template }}" || true
             token=$(kubeadm token generate)
             kubeadm token create $token --ttl=2h
             ca_cert_hash=$(openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -hex | sed 's/^.* //')
-            echo "kubeadm join {{ apiserver_advertise_address }}:6443 --token $token --discovery-token-ca-cert-hash sha256:$ca_cert_hash" > /shared/join-command.sh
+
+            cat <<EOF > "{{ join_file_template }}"
+            apiVersion: kubeadm.k8s.io/v1beta4
+            kind: JoinConfiguration
+            caCertPath: /etc/kubernetes/pki/ca.crt
+            discovery:
+              bootstrapToken:
+                token: "$token"
+                apiServerEndpoint: "{{ apiserver_advertise_address }}:6443"
+                caCertHashes:
+                - "sha256:$ca_cert_hash"
+            nodeRegistration:
+              criSocket: unix:///var/run/containerd/containerd.sock
+              kubeletExtraArgs:
+              - name: node-ip
+                value: NODE_IP
+            timeouts:
+              controlPlaneComponentHealthCheck: 4m0s
+              discovery: 5m0s
+              etcdAPICall: 2m0s
+              kubeletHealthCheck: 4m0s
+              kubernetesAPICall: 1m0s
+              tlsBootstrap: 5m0s
+              upgradeManifests: 5m0s
+
           args:
-            creates: /shared/join-command.sh
+            creates: "{{ join_file_template }}"
 
 
     - name: Worker node configuration
       when: node_role == "worker"
       block:
-        - name: Copy join-command.sh to user's home
-          ansible.builtin.copy:
-            src: /shared/join-command.sh
-            dest: "{{ ansible_env.HOME }}/join-command.sh"
-            mode: '0755'
-            owner: "root"
-            group: "root"
-            remote_src: yes
-          become: yes
         - name: Run join-command.sh
           when: node_role == "worker"
           ansible.builtin.shell: |
-            {{ ansible_env.HOME }}/join-command.sh
+            sed 's/NODE_IP/{{ node_ip }}/g' "{{ join_file_template }}" > "{{ node_join_file }}"
+            kubeadm join --config "{{ node_join_file }}"
           changed_when: true
+
+    - name: Ensure the seccomp directory exists
+      file:
+        path: /var/lib/kubelet/seccomp
+        state: directory
+        mode: '0755'
+    - name: Write kubelet seccomp config
+      copy:
+        dest: /var/lib/kubelet/seccomp/notify.json
+        content: |
+          {
+            "defaultAction": "SCMP_ACT_ALLOW",
+            "listenerPath": "/run/seccomp-agent.socket",
+            "syscalls": [
+              {
+                "names": ["mkdir"],
+                "action": "SCMP_ACT_NOTIFY"
+              }
+            ]
+          }
+
+    - name: Restart kubelet
+      systemd:
+        name: kubelet
+        state: restarted
+        enabled: yes
+        daemon_reload: yes
