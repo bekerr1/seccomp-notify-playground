@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: seccomp-notify-test
+spec:
+  restartPolicy: Never
+  securityContext:
+    seccompProfile:
+      type: Localhost
+      localhostProfile: notify.json
+  containers:
+  - name: test-container
+    image: nicolaka/netshoot
+    command: ["sleep", "infinity"]
+    securityContext:
+      allowPrivilegeEscalation: false
