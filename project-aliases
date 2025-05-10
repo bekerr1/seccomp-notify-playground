@@ -1,0 +1,1 @@
+alias k='KUBECONFIG=private/config kubectl'

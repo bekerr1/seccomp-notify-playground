@@ -42,8 +42,7 @@ spec:
       hostPID: true
       containers:
       - name: seccomp-agent
-        image: quay.io/kinvolk/seccompagent:latest
-        command: [ "/bin/seccompagent", "-resolver=kubernetes", "-log=trace" ]
+        image: local-registry:5000/seccomp-agent
         imagePullPolicy: Always
         env:
           - name: NODE_NAME
