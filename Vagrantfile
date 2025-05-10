@@ -23,6 +23,7 @@ Vagrant.configure("2") do |config|
   # Private is created when vagrantfile is ran. This is where tmp files are generated and shared 
   # between VMs. Stuff with short lived credentials, kubeconfigs, ect.
   config.vm.synced_folder "./private", "/private", create: true, mount_options: ["dmode=777", "fmode=666"]
+  config.vm.synced_folder "./shared", "/shared", create: true, mount_options: ["dmode=777", "fmode=666"]
 
   config.vm.define "control-plane" do |cp|
     cp.vm.hostname = "k8s-control-plane"
