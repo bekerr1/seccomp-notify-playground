@@ -1,7 +1,9 @@
 package main
 
 import (
+	"fmt"
 	"log"
+	"math"
 	"os"
 	"syscall"
 
@@ -51,45 +53,27 @@ func main() {
 			log.Printf("Accept error: %v", err)
 			continue
 		}
-		go handle(fd)
+		go socketFDHandler(fd)
 	}
 }
 
-func handle(fd int) {
+func socketFDHandler(fd int) {
 	log.Printf("Accepted connection: %d", fd)
 	defer unix.Close(fd)
-	// Receive SCM_RIGHTS message containing notifyFd
-	oob := make([]byte, unix.CmsgSpace(4))
-	n, oobn, _, _, err := unix.Recvmsg(fd, nil, oob, 0)
+
+	notifyFd, stateData, err := recieveSCMRights(fd)
 	if err != nil {
-		log.Printf("Recvmsg error: %v", err)
+		log.Printf("Error receiving SCM rights: %v", err)
 		return
 	}
-	if n > 0 || oobn == 0 {
-		log.Printf("No control message received")
-		return
-	}
-	msgs, err := syscall.ParseSocketControlMessage(oob[:oobn])
-	if err != nil {
-		log.Printf("ParseSocketControlMessage error: %v", err)
-		return
-	}
-	if len(msgs) == 0 {
-		log.Printf("No SCM_RIGHTS message")
-		return
-	}
-	fds, err := syscall.ParseUnixRights(&msgs[0])
-	if err != nil {
-		log.Printf("ParseUnixRights error: %v", err)
-		return
-	}
-	if len(fds) == 0 {
-		log.Printf("No FDs received")
-		return
-	}
-	notifyFd := libseccomp.ScmpFd(fds[0])
-	defer syscall.Close(int(notifyFd)) // Close notifyFd
-	log.Printf("Received notifyFd from fds [%v]: %d", fds, notifyFd)
+	//unix.Close(fd) // Close the original socket fd
+	defer func() {
+		log.Printf("Closing notifyFd: %d", notifyFd)
+		syscall.Close(int(notifyFd)) // Close notifyFd
+	}()
+
+	log.Printf("Received notifyFd: %d", notifyFd)
+	log.Printf("Received stateData: %v", string(stateData))
 
 	for {
 		req, err := libseccomp.NotifReceive(notifyFd)
@@ -106,12 +90,7 @@ func handle(fd int) {
 			continue
 		}
 
-		syscallName, err := req.Data.Syscall.GetName()
-		if err != nil {
-			log.Printf("error getting syscall name from req data '%v': %v", req.Data.Syscall, err)
-			return
-		}
-		resp := handleSyscall(syscallName, req)
+		resp := handleSyscall(req)
 
 		if err := libseccomp.NotifRespond(notifyFd, &resp); err != nil {
 			log.Printf("NotifRespond error: %v", err)
@@ -120,7 +99,41 @@ func handle(fd int) {
 	}
 }
 
-func handleSyscall(syscallName string, req *libseccomp.ScmpNotifReq) libseccomp.ScmpNotifResp {
+func recieveSCMRights(fd int) (libseccomp.ScmpFd, []byte, error) {
+	// Receive SCM_RIGHTS message containing notifyFd and stateData
+	oob := make([]byte, unix.CmsgSpace(4))
+	stateData := make([]byte, math.MaxInt16)
+	n, oobn, _, _, err := unix.Recvmsg(fd, stateData, oob, 0)
+	if err != nil {
+		log.Printf("Recvmsg error: %v", err)
+		return 0, nil, err
+	}
+	msgs, err := syscall.ParseSocketControlMessage(oob[:oobn])
+	if err != nil {
+		return 0, nil, fmt.Errorf("ParseSocketControlMessage error: %v", err)
+	}
+	if len(msgs) == 0 {
+		return 0, nil, fmt.Errorf("no SCM_RIGHTS message")
+	}
+	fds, err := syscall.ParseUnixRights(&msgs[0])
+	if err != nil {
+		return 0, nil, fmt.Errorf("ParseUnixRights error: %v", err)
+	}
+	if len(fds) == 0 {
+		return 0, nil, fmt.Errorf("no FDs received")
+	}
+	return libseccomp.ScmpFd(fds[0]), stateData[:n], nil
+}
+
+func handleSyscall(req *libseccomp.ScmpNotifReq) libseccomp.ScmpNotifResp {
+	syscallName, err := req.Data.Syscall.GetName()
+	if err != nil {
+		log.Printf("error getting syscall name from req data '%v': %v", req.Data.Syscall, err)
+		return libseccomp.ScmpNotifResp{
+			ID:    req.ID,
+			Error: int32(syscall.ENOTNAM),
+		}
+	}
 	log.Printf("Received syscall: %s [id: %v, args: %v]\n", syscallName, req.ID, req.Data.Args)
 	return libseccomp.ScmpNotifResp{
 		ID:    req.ID,
