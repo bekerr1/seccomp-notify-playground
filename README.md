@@ -1,0 +1,1 @@
+This repo is a playground inspired by the NATless IPv4/IPv6 translation (presented here https://www.youtube.com/watch?v=E-X8LoLl0CM). The Linux kernel never seases to surprise me in what its capable of. When I discovered you could swap FDs within a connect syscall, I had to try it myself. 
