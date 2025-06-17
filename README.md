@@ -1,5 +1,5 @@
 # Intro
-This repo is a playground inspired by the NATless IPv4/IPv6 translation (presented here https://www.youtube.com/watch?v=E-X8LoLl0CM). The Linux kernel never seases to surprise me in what its capable of. When I discovered you could swap FDs within a connect syscall, I had to try it myself. 
+This repo is a playground inspired by the NATless IPv4/IPv6 translation (presented here https://www.youtube.com/watch?v=E-X8LoLl0CM). The Linux kernel never ceases to surprise me in what its capable of. When I discovered you could swap FDs within a connect syscall, I had to try it myself. 
 
 # Impl
 This repo uses virtualbox and vagrant to provision a k8s clusters. Probably this would be achievable with KinD, though I was not confident that KinD could handle the kernel/host/pod boundray well. Sometimes KinD is a bit finiky when kernel things are involved, though this may not be so bad anymore. I have reused this vagrant/virtualbox config for a few other things so it was no issue for me to reuse it.
